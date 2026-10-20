@@ -56,21 +56,3 @@ scenario's top ten skew toward the Great Plains instead (rewards raw MWh, not va
   correlation < 0.8) is **not sensitive** to the exact thresholds chosen — tightening
   or loosening it changes expected portfolio NPV by only a few percent.
 
-## Things to double-check before this goes out
-1. **Revenue rests on one weather year (2014) and one price year (2023).** A calm
-   2014 or an unusual 2023 price year would reorder counties; multi-year wind/price
-   data would be the single biggest improvement.
-2. **Units of `count_houses1`/`sum_prices1-5` (miles vs. km) are not confirmed** in
-   the data documentation — we assumed miles (matches the LBNL property-value
-   literature cited), but this affects the permitting cutoff and Table 11's
-   property-value-loss estimate. Flagged as Limitations item 7.
-3. **Interconnection-queue network-upgrade costs are not in the data** and can be
-   large (LBNL: avg $194/kW completed, up to $671/kW for projects that withdraw) —
-   not county-specific, so not in our ranking, but material to real-world due
-   diligence on the final 10.
-4. **Permitting probabilities (80% base, ±10/-15 points) are stylized**, not
-   calibrated — NREL/OEDI's 2025 county-level wind ordinance database would sharpen
-   this but was not pulled in (see "Declined/open proposals" in CHANGELOG.md).
-5. Seven counties (FIPS 12081, 12091, 12103, 12131, 25007, 37053, 53053) have no
-   price data for any hour of 2023 and are excluded entirely — worth flagging to
-   students as a real, not cosmetic, data gap (e.g. Martha's Vineyard, MA).
