@@ -1,0 +1,1046 @@
+---
+title: "Wind Farm Siting: Where Should NextEra Build Next?"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    number_sections: true
+    code_folding: show
+    md_extensions: "-tex_math_dollars+tex_math_single_backslash"
+---
+
+<!-- "$" is an ordinary dollar sign everywhere in this document (tex_math_dollars is
+     disabled above -- a bare "$" next to another "$" in a table header or caption used
+     to be mis-parsed by pandoc as math, corrupting the HTML). Equations use \(...\) and
+     \[...\] instead, matching the MathJax config below. -->
+<script type="text/x-mathjax-config">
+MathJax.Hub.Config({ tex2jax: { inlineMath: [['\\(','\\)']], displayMath: [['\\[','\\]']], processEscapes: true } });
+</script>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center")
+library(tidyverse)
+library(data.table)   # only used to read the 775 MB hourly file quickly
+library(maps)         # county polygons for the U.S. maps (no internet needed)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+# Small formatting helpers used in tables and inline text
+usd_m  <- function(x, d = 1) paste0(ifelse(x < 0, "-$", "$"),
+                                    formatC(abs(x) / 1e6, format = "f", digits = d, big.mark = ","), "M")
+usd    <- function(x, d = 0) paste0(ifelse(x < 0, "-$", "$"),
+                                    formatC(abs(x), format = "f", digits = d, big.mark = ","))
+pct    <- function(x, d = 1) paste0(formatC(100 * x, format = "f", digits = d), "%")
+```
+
+```{r exec-summary-compute, include=FALSE}
+# R Markdown runs chunks top to bottom, so an Executive Summary at the top of the document
+# can only show numbers that have already been computed. This chunk duplicates the core
+# pipeline (data load -> revenue -> costs/NPV -> permitting risk -> diversified top 10) purely
+# so those headline numbers exist before the pedagogical chunks later in the document walk
+# through the same steps. Every later chunk recomputes these exact same objects from scratch using the
+# pedagogical, step-by-step code the student sees -- this chunk is overwritten harmlessly and
+# is not the "real" source of any number below; it just lets the summary come first. Keeping
+# two copies of the same ~10 lines of arithmetic in sync is a real maintenance cost of putting
+# an executive summary first in a reproducible document; flagged in the CHANGELOG.
+.exec_county_path <- "CountyChars.csv"; .exec_prod_path <- "ProdAndPrice.csv"
+.ec <- read_csv(.exec_county_path, show_col_types = FALSE) %>%
+  filter(!is.na(FIPS), !is.na(state)) %>% mutate(FIPS = as.integer(FIPS))
+.ep <- fread(.exec_prod_path)
+.ec_find <- function(pattern) grep(pattern, tolower(names(.ep)))[1]
+setnames(.ep, c(.ec_find("fips"), .ec_find("hour"), .ec_find("prod"), .ec_find("price")),
+         c("FIPS", "hour", "prod_kwh", "price"))
+.ep[, FIPS := as.integer(FIPS)]
+.ep <- .ep[!is.na(price)]
+
+.ec_rev <- .ep[, .(gen_mwh = sum(prod_kwh) / 1000, revenue = sum(prod_kwh / 1000 * price)), by = FIPS] %>%
+  as_tibble()
+.ec_wind <- .ec %>% inner_join(.ec_rev, by = "FIPS")
+.ec_median_land <- median(.ec$per_acre_profit, na.rm = TRUE)
+
+.ec_npv <- .ec_wind %>% mutate(
+  land_index  = coalesce(per_acre_profit / .ec_median_land, 1),
+  fixed_cost  = 1968 * 200 * 1000 + 1.5e6 * distance_to_transmission_km + 0.5e6 * distance_to_road_km,
+  mc          = 6 + 0.002 * distance_to_transmission_km + 0.25 * distance_to_road_km,
+  annual_op_cost = mc * gen_mwh + 200 * (25 * 1000 + 4000 + 4000 * land_index),
+  af          = sum((1.06)^-(1:25)),
+  npv         = revenue * af - annual_op_cost * af - fixed_cost,
+  breakeven_price = (fixed_cost + annual_op_cost * af) / (gen_mwh * af),
+  dev_cost    = 36 * 200 * 1000,
+  house_p90   = quantile(count_houses1, 0.9, na.rm = TRUE),
+  p_permit    = 0.80 + 0.10 * (count_turbines > 0) - 0.15 * (count_houses1 > house_p90),
+  npv_risk    = p_permit * npv - (1 - p_permit) * dev_cost
+)
+
+.ec_npv_ptc <- .ec_npv %>% mutate(
+  af_ptc = sum((1.06)^-(1:10)),
+  npv    = revenue * af - annual_op_cost * af - fixed_cost + 26 * gen_mwh * af_ptc
+)
+
+.ec_n_profitable     <- sum(.ec_npv$npv > 0)
+.ec_n_profitable_ptc <- sum(.ec_npv_ptc$npv > 0)
+.ec_top10            <- .ec_npv %>% slice_max(npv_risk, n = 10)
+.ec_npv_m_range      <- range(.ec_top10$npv)   # usd_m() below divides by 1e6 itself
+.ec_breakeven_range  <- range(.ec_top10$breakeven_price)
+.ec_n_counties       <- nrow(.ec_npv)
+```
+
+# Executive Summary
+
+**The headline result: under today's wholesale prices, costs, and policy (no production tax credit), none of `r comma(.ec_n_counties)` counties we can evaluate has a positive NPV for a standalone 200 MW merchant wind farm.** Even the best sites only get close to break-even. This is the single most important finding in this report and should shape how NextEra frames the decision -- as choosing the *least-bad*, most option-creating sites rather than ten slam-dunk projects.
+
+* **If a production tax credit were fully reinstated** (not our base case -- see Section 8), **`r comma(.ec_n_profitable_ptc)` of `r comma(.ec_n_counties)` counties become NPV-positive.** The credit rewards high-capacity-factor sites (the windy Great Plains), which is a different list than the high-captured-price sites (coastal New England) that lead the no-PTC ranking -- the recommended list below is chosen to perform reasonably under both.
+* **Top-10 candidates (risk-adjusted for permitting) run from about `r usd_m(.ec_npv_m_range[2])` to `r usd_m(.ec_npv_m_range[1])` NPV**, and need a break-even power price of **roughly $`r round(.ec_breakeven_range[1])`-$`r round(.ec_breakeven_range[2])`/MWh** -- useful numbers for negotiating a PPA, since several are below plausible contract prices even though the merchant NPV is negative.
+* We recommend **diversifying the final ten** across states and wholesale balancing areas rather than taking the ten highest-NPV counties outright, because the highest-NPV sites cluster in a few correlated regions (Section 12's Table 12 quantifies the trade-off).
+* **See Table 13 (Section 13) for the specific ten recommended counties** with full financials, and Table 7b for how robust each one is to joint uncertainty in costs, discount rate, and policy.
+
+---
+
+# The Question and the Economic Logic
+
+NextEra wants ten U.S. counties for a new wave of wind farms, with construction starting in late 2026. Each farm is **80 turbines × 2.5 MW = 200 MW** and lives **25 years**.
+
+The decision rule is the one we use for any long-lived investment: **build where the net present value (NPV) is highest.** For a county \(j\),
+
+\[NPV_j = \underbrace{\sum_{t=1}^{25}\frac{\text{Revenue}_{jt} - \text{OperatingCost}_{jt}}{(1+r)^t}}_{\text{value of 25 years of operation}} \;-\; \underbrace{\text{FixedCost}_j}_{\text{paid up front}}\]
+
+Think of it like buying a rental property. The up-front price is the turbines, foundations, roads and the power line to the grid. The "rent" is the electricity sold each hour. What makes one county better than another comes down to three things:
+
+1. **How much wind blows** (annual generation, MWh).
+2. **When it blows and what power is worth then** (the price the farm actually captures).
+3. **How expensive it is to build and connect there** (distance to roads and to the transmission grid, land, local permitting).
+
+Sections 3–5 build each piece, Section 6 puts them together, and Sections 7–12 stress-test the answer against the questions raised in the case (policy, joint uncertainty, price-taking, permitting, clustering).
+
+---
+
+# Data
+
+```{r load-data}
+# ── Set these paths to wherever you saved the data ───────────────────────────
+county_path <- "CountyChars.csv"
+prod_path   <- "ProdAndPrice.csv"
+
+counties <- read_csv(county_path, show_col_types = FALSE) %>%
+  filter(!is.na(FIPS), !is.na(state)) %>%
+  mutate(FIPS = as.integer(FIPS))
+
+# County names, for readable tables. maps::county.fips gives a name for all but 4 of our
+# 3,017 counties (checked directly): FIPS 51600/51620/51760/51770 are Virginia independent
+# cities (Fairfax, Franklin, Richmond, Roanoke) that aren't in the maps package's county
+# polygons at all, so they are also absent from every county map figure below -- a real,
+# documented gap, not a bug we can fix without a different shapefile.
+data(county.fips)
+county_name_lookup <- county.fips %>%
+  mutate(polyname = as.character(polyname),
+         county_name = str_to_title(str_remove(str_remove(polyname, "^[^,]+,"), ":.*"))) %>%
+  distinct(fips, .keep_all = TRUE) %>%
+  select(FIPS = fips, county_name) %>%
+  bind_rows(tibble(FIPS = c(51600, 51620, 51760, 51770),
+                    county_name = c("Fairfax City", "Franklin City", "Richmond City", "Roanoke City")))
+
+counties <- counties %>% left_join(county_name_lookup, by = "FIPS") %>%
+  mutate(county_label = paste0(county_name, ", ", state))
+
+# The hourly file is ~26 million rows. fread() reads it in under a minute.
+pp <- fread(prod_path)
+
+# Standardise column names (robust to small differences in the header text)
+find_col <- function(pattern) {
+  i <- grep(pattern, tolower(names(pp)))
+  if (length(i) != 1) stop("Could not uniquely find a column matching '", pattern, "'")
+  i
+}
+setnames(pp,
+         c(find_col("fips"), find_col("hour"), find_col("prod"), find_col("price")),
+         c("FIPS", "hour", "prod_kwh", "price"))
+pp[, FIPS := as.integer(FIPS)]
+
+n_fips_raw <- uniqueN(pp$FIPS)
+# Seven counties have Price == NA for every one of their 8,760 hours. Production is
+# reported normally for them, so this is a real gap in Cambium's balancing-area coverage
+# (e.g. municipal utilities or island grids outside the standard ISO footprints), not a
+# parsing issue. They cannot be assigned a revenue, so we drop them from every revenue,
+# cost and NPV calculation below.
+no_price_fips <- pp[is.na(price), unique(FIPS)]
+pp <- pp[!is.na(price)]
+
+# Recover balancing areas. Cambium assigns one hourly price path per balancing area and
+# re-uses it for every county inside that area, so counties sharing a balancing area have
+# IDENTICAL hourly price series. We group on a compact signature (sum, sd, and three
+# spot-check hours of each county's 8,760-hour price vector) rather than comparing all
+# hours pairwise across ~3,000 counties; with a continuous price series, the chance of two
+# different areas colliding on all five signature values is negligible.
+area_sig <- pp[, .(sum_p = sum(price), sd_p = sd(price),
+                    p100 = price[101], p3000 = price[3001], p6000 = price[6001]), by = FIPS]
+area_sig[, balancing_area := .GRP, by = .(sum_p, sd_p, p100, p3000, p6000)]
+n_balancing_areas <- uniqueN(area_sig$balancing_area)
+
+counties <- counties %>%
+  left_join(as_tibble(area_sig) %>% select(FIPS, balancing_area), by = "FIPS")
+```
+
+**CountyChars.csv** has `r nrow(counties)` counties in `r n_distinct(counties$state)` states. **ProdAndPrice.csv** has `r comma(nrow(pp))` county-hour rows covering `r comma(uniqueN(pp$FIPS))` of `r comma(n_fips_raw)` counties with usable price data: hourly output (kWh) from a standard 80-turbine farm built from measured 2014 wind speeds, plus the hourly wholesale price ($/MWh) of the local balancing area (NREL Cambium, 2023). Seven counties (FIPS `r paste(no_price_fips, collapse = ", ")`) report production but have no price for any hour of 2023 and are excluded from every result in this report. Counties that share an identical hourly price series sit in the same wholesale balancing area; grouping on that basis recovers **`r comma(n_balancing_areas)` distinct balancing areas** across the `r comma(nrow(counties))` counties -- a much finer (and more economically meaningful) grid than the 48 states, and the unit we use below for cannibalization and portfolio diversification.
+
+```{r explore-chars}
+counties %>%
+  select(`Distance to transmission (km)` = distance_to_transmission_km,
+         `Distance to road (km)`         = distance_to_road_km,
+         `Existing turbines (2023)`      = count_turbines,
+         `Farmland profit ($/acre/yr)`   = per_acre_profit,
+         `Homes within ring 1`           = count_houses1,
+         `State RPS target (if any)`     = rps_amount) %>%
+  mutate(`State RPS target (if any)` = na_if(`State RPS target (if any)`, -1)) %>%
+  pivot_longer(everything()) %>%
+  group_by(Variable = name) %>%
+  summarise(Mean = mean(value, na.rm = TRUE),
+            Median = median(value, na.rm = TRUE),
+            P10 = quantile(value, .10, na.rm = TRUE),
+            P90 = quantile(value, .90, na.rm = TRUE),
+            Max = max(value, na.rm = TRUE)) %>%
+  kable(digits = 2, caption = "Table 1. County characteristics (CountyChars.csv)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r map-helper}
+# ── Reusable county map. Uses the 'maps' package, so no downloads required ───
+county_shapes <- map_data("county") %>%
+  mutate(polyname = paste(region, subregion, sep = ",")) %>%
+  left_join(county.fips %>%
+              mutate(polyname = str_remove(polyname, ":.*")) %>%
+              distinct(polyname, .keep_all = TRUE),
+            by = "polyname") %>%
+  rename(FIPS = fips)
+
+plot_county_map <- function(df, var, title, legend, labels = comma,
+                            option = "viridis", direction = 1, trans = "identity") {
+  county_shapes %>%
+    left_join(df %>% mutate(value = {{ var }}) %>% select(FIPS, value), by = "FIPS") %>%
+    ggplot(aes(long, lat, group = group, fill = value)) +
+    geom_polygon(colour = NA) +
+    borders("state", colour = "white", linewidth = 0.2) +
+    coord_quickmap() +
+    scale_fill_viridis_c(option = option, direction = direction, labels = labels,
+                         trans = trans, na.value = "grey85", name = legend) +
+    labs(title = title) +
+    theme_void() +
+    theme(legend.position = "bottom", legend.key.width = unit(1.6, "cm"),
+          plot.title = element_text(face = "bold"))
+}
+```
+
+```{r map-existing, fig.width=9, fig.height=5.5}
+plot_county_map(counties %>% mutate(t = na_if(count_turbines, 0)), t,
+                "Figure 1. Existing wind turbines by county (2023)",
+                "Turbines (log scale)", trans = "log10", option = "mako", direction = -1)
+```
+
+*Figure 1. Existing wind development is concentrated in the Great Plains corridor (Texas to the Dakotas), Iowa, and pockets of the West. Grey counties have no turbines. These are places where wind has already proven itself commercially and locally.*
+
+---
+
+# Exercise 2: Revenues
+
+## Annual generation and revenue by county
+
+For every county, annual revenue is just production times price, summed over all 8,760 hours:
+
+\[\text{Revenue}_j = \sum_{h=1}^{8760} Q_{jh}\times P_{jh}\]
+
+```{r revenue}
+nameplate_mw <- 200
+
+county_rev <- pp[, .(
+  gen_mwh              = sum(prod_kwh) / 1000,
+  revenue              = sum(prod_kwh / 1000 * price),
+  avg_price            = mean(price),                 # simple average over all hours
+  zero_price_hours     = sum(price == 0),             # price floors at $0 in this data (see below)
+  gen_mwh_at_zero_price = sum(prod_kwh[price == 0]) / 1000,
+  n_hours              = .N
+), by = FIPS] %>%
+  as_tibble() %>%
+  mutate(
+    capacity_factor = gen_mwh / (nameplate_mw * n_hours),
+    capture_price   = revenue / gen_mwh,                # $/MWh the farm actually earns
+    value_factor    = capture_price / avg_price          # <1 means wind blows in cheap hours
+  )
+
+wind <- counties %>% inner_join(county_rev, by = "FIPS")
+```
+
+```{r revenue-summary}
+wind %>%
+  reframe(
+    `Annual generation (GWh)`  = c(mean(gen_mwh), median(gen_mwh), max(gen_mwh)) / 1000,
+    `Capacity factor`          = c(mean(capacity_factor), median(capacity_factor), max(capacity_factor)),
+    `Annual revenue ($M)`      = c(mean(revenue), median(revenue), max(revenue)) / 1e6,
+    `Capture price ($/MWh)`    = c(mean(capture_price), median(capture_price), max(capture_price)),
+    `Value factor`             = c(mean(value_factor), median(value_factor), max(value_factor))
+  ) %>%
+  mutate(Statistic = c("Mean", "Median", "Max"), .before = 1) %>%
+  kable(digits = 2, caption = "Table 2. Revenue-side statistics for a 200 MW farm, across counties") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r map-revenue, fig.width=9, fig.height=5.5}
+plot_county_map(wind, revenue / 1e6, "Figure 2. Annual revenue of a 200 MW wind farm",
+                "Annual revenue ($M)", labels = label_dollar(suffix = "M"), option = "viridis")
+```
+
+```{r map-cf, fig.width=9, fig.height=5.5}
+plot_county_map(wind, capacity_factor, "Figure 3. Capacity factor (how hard the wind blows)",
+                "Capacity factor", labels = label_percent(), option = "cividis")
+```
+
+*Figures 2–3. Revenue is driven by two maps laid on top of each other: how much the wind blows (Figure 3) and how valuable power is in that region. A county with middling wind can still earn high revenue if it sells into an expensive market.*
+
+The median county earns **`r usd_m(median(wind$revenue))` per year** from **`r comma(round(median(wind$gen_mwh)/1000))` GWh** (a `r pct(median(wind$capacity_factor))` capacity factor). The top county earns `r usd_m(max(wind$revenue))`.
+
+## Does it matter *when* the farm is most productive? (Footnote 3)
+
+Yes. Two counties with identical annual MWh can earn very different revenue if one county's wind blows mostly at night, when power is cheap, and the other's blows during the late-afternoon peak. The **value factor** captures this: the farm's average earned price divided by the simple average price in its market. A value factor of 0.90 means the farm earns 10% less per MWh than a "flat" generator would, because its output is tilted toward cheap hours.
+
+```{r value-factor-plot, fig.width=8, fig.height=4.5}
+ggplot(wind, aes(value_factor)) +
+  geom_histogram(bins = 50, fill = "#2c7fb8", colour = "white") +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  labs(title = "Figure 4. Wind output is usually tilted toward cheaper hours",
+       subtitle = "Value factor = capture price / simple average price. Left of the dashed line = wind blows when power is cheap.",
+       x = "Value factor", y = "Number of counties") +
+  theme_minimal()
+```
+
+```{r diurnal, fig.width=9, fig.height=4.5}
+# Average shape of a day: price vs. wind output, nationally
+hour_base <- min(pp$hour)
+diurnal <- pp[, .(price = mean(price), cf = mean(prod_kwh) / 1000 / nameplate_mw),
+              by = .(hod = (hour - hour_base) %% 24)] %>% as_tibble()
+
+diurnal %>%
+  mutate(price_idx = price / mean(price), cf_idx = cf / mean(cf)) %>%
+  pivot_longer(c(price_idx, cf_idx)) %>%
+  mutate(name = recode(name, price_idx = "Electricity price", cf_idx = "Wind output")) %>%
+  ggplot(aes(hod, value, colour = name)) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  scale_colour_manual(values = c("#d95f02", "#1b9e77")) +
+  labs(title = "Figure 5. An average day across all counties (indexed to the daily mean = 1)",
+       subtitle = "Hour of day as indexed in the data file -- see note below on time zone",
+       x = "Hour of day", y = "Index", colour = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+`r round(100*mean(wind$value_factor < 1))`% of counties have a value factor below 1. The median is `r round(median(wind$value_factor), 3)`, so ranking counties by MWh alone would overstate the value of night-heavy wind sites. Our NPV uses hour-by-hour revenue, so timing is built in automatically.
+
+**What time zone is `hour` in?** Not stated explicitly, but Figure 5 lets us infer it: averaging price and output by `hour %% 24` across all ~3,000 counties nationally still produces one clean, sharp peak (hour 17-18) rather than a smeared one. If `hour` were in a single common clock (e.g. UTC), the roughly three-hour spread between Eastern and Pacific local afternoons would blur that national average into a flatter, wider hump. A sharp peak across the whole country is only consistent with each balancing area's hours already being indexed to **its own local standard time** -- i.e., hour 17 means "5pm locally" everywhere, not "5pm Eastern" everywhere. We treat `hour` this way; it does not affect any revenue calculation (which is always done county-by-county on its own 8,760-hour series), only the interpretation of Figure 5.
+
+**Does price ever go negative?** No. In this dataset the wholesale price floors at exactly $0/MWh and never goes below it — about `r pct(sum(wind$zero_price_hours)/sum(wind$n_hours))` of all county-hours sit right at that floor (oversupplied, breezy hours where the market clears at zero rather than below it), accounting for `r pct(sum(wind$gen_mwh_at_zero_price)/sum(wind$gen_mwh))` of total generation nationally. Because price is never negative, there is no revenue lost by continuing to produce through these hours: $0 price times any output is still $0, so our "always produce" baseline revenue is already correct as a revenue number. What differs is the **cost** side: running turbines through a zero-revenue hour still costs a few dollars of wear-and-tear with nothing to show for it, so once marginal cost is in hand (Section 5) it is weakly better to curtail at the $0 floor. We quantify that, and revisit it again once a tax credit makes producing through zero-price hours profitable outright, in Section 8.
+
+---
+
+# Exercise 1: Costs
+
+## The cost function
+
+Following the case, costs take the form
+
+\[TotalCost_j(Q) = FixedCost_j + MarginalCost_j \cdot Q\]
+
+\[FixedCost_j = \beta_0 + \beta_1\,\text{dist to transmission}_j + \beta_2\,\text{dist to road}_j\]
+\[MarginalCost_j = \alpha_0 + \alpha_1\,\text{dist to transmission}_j + \alpha_2\,\text{dist to road}_j\]
+
+We interpret **FixedCost** as the one-time, up-front construction bill, and **MarginalCost** as the operating cost per MWh. We add one more term the case form leaves out: **annual fixed operating costs** (insurance, land lease, property tax, administration). These are paid every year whether the wind blows or not, so they are neither up-front nor per-MWh.
+
+## Choosing the six coefficients (and the extra annual terms)
+
+All values are in **2023 dollars** for a 200 MW farm. Everything below lives in one list, `p_base`, so any assumption can be changed in one place.
+
+```{r assumptions}
+p_base <- list(
+  mw               = 200,
+  life             = 25,
+  # ── Fixed (up-front) cost ────────────────────────────────────────────────
+  capex_per_kw     = 1968,     # beta0 / 200,000 kW. NREL Cost of Wind Energy Review 2024 Ed.
+  beta_trans       = 1.5e6,    # $ per km of new spur line (~$2.4M/mile, 138–230 kV single circuit)
+  beta_road        = 0.5e6,    # $ per km of new heavy-haul access road
+  beta_trans_sq    = 0,        # optional convexity for very long lines (see 4.4)
+  # ── Marginal (per-MWh) cost ──────────────────────────────────────────────
+  alpha0           = 6,        # $/MWh wear-and-tear O&M
+  alpha_trans      = 0.002,    # $/MWh per km: line losses (~0.005%/km × ~$35/MWh)
+  alpha_road       = 0.25,     # $/MWh per km: crew and crane access for repairs
+  # ── Annual fixed operating cost ──────────────────────────────────────────
+  fixed_om_per_kw  = 25,       # $/kW-yr insurance, admin, monitoring
+  land_per_mw      = 4000,     # $/MW-yr lease in the median-land-value county, scaled by local farmland profit
+  prop_tax_per_mw  = 4000,     # $/MW-yr property tax / PILOT
+  # ── Finance and markets ──────────────────────────────────────────────────
+  r                = 0.06,     # real discount rate (merchant project, no PTC)
+  price_growth     = 0,        # real annual change in captured price
+  ptc              = 0,        # $/MWh production tax credit (baseline: none, OBBBA)
+  ptc_years        = 10,
+  p_ptc            = 1,        # probability the PTC applies (only matters if ptc > 0)
+  rec_price        = 0         # $/MWh renewable energy credit in RPS states
+)
+
+median_land <- median(counties$per_acre_profit, na.rm = TRUE)
+```
+
+```{r assumptions-table, echo=FALSE}
+tribble(
+  ~Parameter, ~Value, ~`Type`, ~Rationale,
+  "β0: base construction cost", "$1,968/kW → $394M", "Fixed",
+  "NREL *Cost of Wind Energy Review: 2024 Edition* land-based reference plant (2023$): turbine $1,091/kW, balance of system $582/kW (incl. site roads, foundations, collection system, transport), soft costs $295/kW.",
+  "β1: spur transmission line", "$1.5M per km", "Fixed",
+  "Interconnection to the grid. Utility cost guides (e.g. MISO Transmission Cost Estimation Guide) put new 138–230 kV single-circuit lines at roughly $1.5–2.5M per mile; we use ~$2.4M/mile. NREL's capex stops at the project substation, so this is additive.",
+  "β2: access road", "$0.5M per km", "Fixed",
+  "Heavy-haul gravel road able to carry blades and cranes. Distances are short (median ~1.6 km), so this term matters far less than β1.",
+  "α0: variable O&M", "$6/MWh", "Marginal",
+  "Component wear rises with operating hours. Together with the $25/kW-yr fixed O&M below, this reproduces NREL's $43/kW-yr total O&M at a ~40% capacity factor.",
+  "α1: line losses", "$0.002/MWh per km", "Marginal",
+  "Roughly 0.5% energy loss per 100 km, valued at ~$35/MWh. Small by design.",
+  "α2: remote access O&M", "$0.25/MWh per km", "Marginal",
+  "Longer travel for crews and cranes when far from public roads.",
+  "Fixed O&M", "$25/kW-yr", "Annual",
+  "Insurance, monitoring and admin: the non-wear part of NREL's $43/kW-yr.",
+  "Land lease", "$4,000/MW-yr × local land index", "Annual",
+  "Typical landowner payments are a few thousand $/MW-yr. We scale by `per_acre_profit` relative to the median county, so land is pricier where farmland earns more.",
+  "Property tax / PILOT", "$4,000/MW-yr", "Annual",
+  "Typical state wind tax regimes; held constant across counties for simplicity.",
+  "Discount rate", "6% real", "Finance",
+  "Above NREL's 3.7% real WACC because a merchant project without a tax credit carries more price risk. Varied from 4% to 8% in Section 7.",
+  "Production tax credit", "$0 (baseline)", "Policy",
+  "OBBBA ends §45Y eligibility for wind that begins construction after July 4, 2026, unless placed in service by Dec. 31, 2027. Scenarios in Section 8."
+) %>%
+  kable(caption = "Table 3. Cost and finance assumptions (all 2023 dollars)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE) %>%
+  column_spec(4, width = "55%")
+```
+
+## Which costs are in the model, and which vary by county?
+
+```{r cost-taxonomy, echo=FALSE}
+tribble(
+  ~`Cost item`, ~`In the model as…`, ~`Varies across counties?`, ~Comment,
+  "Turbine procurement", "Fixed (β0)", "No", "Turbines are bought on a national market.",
+  "Construction", "Fixed (β0)", "Partly (not modelled)", "Labour and crane costs vary regionally; NREL estimates regional BOS variation of roughly ±10%.",
+  "Road building", "Fixed (β2 × distance)", "Yes", "Driven by distance to the nearest road.",
+  "Labour", "Fixed (in β0) and marginal (α0)", "Partly (not modelled)", "Wage differences are second-order relative to capex.",
+  "Maintenance (wear and tear)", "Marginal (α0, α2)", "Yes, via road access", "Wear scales with output; access cost scales with remoteness.",
+  "Land", "Annual fixed (land index)", "Yes", "Scaled by local farmland profitability.",
+  "Generation taxes / subsidies", "Per-MWh credit (PTC scenarios)", "Yes (state RECs)", "Baseline has no federal PTC.",
+  "Interconnection", "Fixed (β1 × distance)", "Yes", "Spur line to the grid. Network-upgrade charges from the interconnection queue are excluded but can be large."
+) %>%
+  kable(caption = "Table 4. How each cost category from the case enters the model") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE)
+```
+
+**Costs we leave out, and why:** income taxes and depreciation (we compute a pre-tax project NPV); decommissioning (roughly offset by scrap value of steel); interconnection-queue network-upgrade fees (real but not observable by county in our data, and potentially large -- LBNL's balancing-area interconnection cost studies put completed land-based wind projects' network-upgrade costs at an average of about **$194/kW** for 2018-2024, rising to **$671/kW** for projects that ultimately withdraw from the queue, i.e. $39M-$134M for our 200 MW farm, on top of the spur-line cost already in our model); and financing costs during construction (already in NREL's soft costs).
+
+## Should the cost function be nonlinear?
+
+There are good reasons to think so, though we keep the linear baseline:
+
+* **Transmission is "lumpy."** Beyond roughly 50–80 km a 200 MW farm may need a higher-voltage line, reactive compensation, and a harder right-of-way process, so cost per km rises with distance. `beta_trans_sq` adds a quadratic term; Section 7 tests it.
+* **Scale economies.** Fixed costs per MW fall with farm size. Every farm is the same 200 MW here, so this does not affect the ranking.
+* **Interaction with output.** Remote, windy sites need the long line *because* they are windy. The NPV handles this trade-off directly.
+
+## County-level costs
+
+```{r costs}
+compute_npv <- function(df, p) {
+  disc      <- (1 + p$r)^-(1:p$life)
+  af        <- sum(disc)                                          # 25-yr annuity factor
+  af_growth <- sum((1 + p$price_growth)^(0:(p$life - 1)) * disc)  # revenue grows/shrinks with prices
+  af_ptc    <- sum(disc[1:p$ptc_years])                           # PTC lasts 10 years
+
+  df %>% mutate(
+    land_index  = coalesce(per_acre_profit / median_land, 1),
+    # ── Fixed (up-front) cost ──
+    fixed_cost  = p$capex_per_kw * p$mw * 1000 +
+                  p$beta_trans * distance_to_transmission_km +
+                  p$beta_trans_sq * distance_to_transmission_km^2 +
+                  p$beta_road  * distance_to_road_km,
+    # ── Marginal cost ($/MWh) and annual costs ──
+    mc               = p$alpha0 + p$alpha_trans * distance_to_transmission_km +
+                       p$alpha_road * distance_to_road_km,
+    annual_var_cost  = mc * gen_mwh,
+    annual_fixed_op  = p$mw * (p$fixed_om_per_kw * 1000 + p$prop_tax_per_mw +
+                               p$land_per_mw * land_index),
+    annual_op_cost   = annual_var_cost + annual_fixed_op,
+    # ── Present values ──
+    rec_rev     = p$rec_price * gen_mwh * (rps_exists == 1),
+    pv_revenue  = revenue * af_growth + rec_rev * af,
+    pv_ptc      = p$p_ptc * p$ptc * gen_mwh * af_ptc,
+    pv_op_cost  = annual_op_cost * af,
+    npv         = pv_revenue + pv_ptc - pv_op_cost - fixed_cost,
+    annual_profit = revenue + rec_rev - annual_op_cost,            # operating profit, year 1
+    # Levelized cost of energy and break-even captured price ($/MWh)
+    lcoe        = (fixed_cost + pv_op_cost) / (gen_mwh * af),
+    breakeven_price = (fixed_cost + pv_op_cost - pv_ptc - rec_rev * af) / (gen_mwh * af_growth)
+  )
+}
+
+base <- compute_npv(wind, p_base)
+```
+
+```{r map-fixed, fig.width=9, fig.height=5.5}
+plot_county_map(base, fixed_cost / 1e6, "Figure 6. Up-front fixed cost (FixedCost_j)",
+                "Fixed cost ($M)", labels = label_dollar(suffix = "M"),
+                option = "rocket", direction = -1)
+```
+
+```{r map-mc, fig.width=9, fig.height=5.5}
+plot_county_map(base, mc, "Figure 7. Marginal cost (MarginalCost_j)",
+                "$/MWh", labels = label_dollar(), option = "rocket", direction = -1)
+```
+
+*Figures 6–7. Fixed cost ranges from `r usd_m(min(base$fixed_cost))` to `r usd_m(max(base$fixed_cost))`. Almost all of the spread comes from distance to the grid: the median county is `r round(median(base$distance_to_transmission_km))` km from transmission, adding `r usd_m(p_base$beta_trans*median(base$distance_to_transmission_km))` to a base of `r usd_m(p_base$capex_per_kw*p_base$mw*1000)`. Marginal cost varies little, from `r usd(min(base$mc),2)` to `r usd(max(base$mc),2)` per MWh, because roads are close almost everywhere.*
+
+---
+
+# Profit and Net Present Value
+
+## How many counties are profitable?
+
+```{r npv-overview}
+n_pos <- sum(base$npv > 0)
+```
+
+Under the baseline (no tax credit, 6% real discount rate, 2023 prices held flat), **`r n_pos` of `r nrow(base)` counties have a positive NPV.** The median county's levelized cost is `r usd(median(base$lcoe),1)`/MWh against a median captured price of `r usd(median(base$capture_price),1)`/MWh.
+
+```{r lcoe-vs-price, fig.width=8.5, fig.height=5.5}
+ggplot(base, aes(lcoe, capture_price)) +
+  geom_point(aes(colour = npv > 0), alpha = 0.5, size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_colour_manual(values = c("TRUE" = "#1a9850", "FALSE" = "grey60"),
+                      labels = c("TRUE" = "NPV > 0", "FALSE" = "NPV <= 0"), name = NULL) +
+  coord_cartesian(xlim = quantile(base$lcoe, c(0, .98)),
+                  ylim = quantile(base$capture_price, c(0, .999))) +
+  labs(title = "Figure 8. What a county earns per MWh vs. what it costs to produce one",
+       subtitle = "Above the dashed line, the captured price covers the levelized cost (roughly NPV > 0)",
+       x = "Levelized cost of energy ($/MWh)", y = "Captured price ($/MWh)") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+```{r map-npv, fig.width=9, fig.height=5.5}
+plot_county_map(base, npv / 1e6, "Figure 9. Baseline NPV of a 200 MW wind farm",
+                "NPV ($M)", labels = label_dollar(suffix = "M"), option = "turbo")
+```
+
+**Reading Figure 8.** Every county is one dot. Its horizontal position is the cost of producing a MWh there over the farm's life, including paying back the construction bill; its vertical position is what a MWh sells for there. Counties above the 45-degree line make money.
+
+The baseline result reflects a real feature of today's market: **at 2023 wholesale prices and without a tax credit, a merchant wind farm is a marginal investment in much of the country.** In practice, developers close this gap by signing long-term power purchase agreements (PPAs) above spot prices with utilities and corporate buyers, and by selling renewable energy credits. Our county *ranking* is still informative, because a higher PPA price lifts all counties' revenues roughly in proportion to their output.
+
+## Baseline top ten
+
+```{r top10-baseline}
+top10_base <- base %>% slice_max(npv, n = 10)
+
+top10_table <- function(df, caption) {
+  df %>%
+    transmute(FIPS, County = county_name, State = state,
+              `Gen (GWh/yr)`      = gen_mwh / 1000,
+              `CF`                = pct(capacity_factor),
+              `Revenue ($M/yr)`   = revenue / 1e6,
+              `Capture price ($/MWh)` = capture_price,
+              `Fixed cost ($M)`   = fixed_cost / 1e6,
+              `Op. cost ($M/yr)`  = annual_op_cost / 1e6,
+              `LCOE ($/MWh)`      = lcoe,
+              `NPV ($M)`          = npv / 1e6) %>%
+    kable(digits = 1, caption = caption) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE)
+}
+top10_table(top10_base, "Table 5. Top 10 counties by NPV — baseline assumptions")
+```
+
+```{r why-top, echo=FALSE}
+cmp <- tibble(
+  group = c("Top 10", "All counties"),
+  cf    = c(mean(top10_base$capacity_factor), mean(base$capacity_factor)),
+  cap   = c(mean(top10_base$capture_price),   mean(base$capture_price)),
+  dist  = c(mean(top10_base$distance_to_transmission_km), mean(base$distance_to_transmission_km))
+)
+```
+
+**Why these counties win:** the baseline top ten average a `r pct(cmp$cf[1])` capacity factor (vs. `r pct(cmp$cf[2])` overall), a `r usd(cmp$cap[1],1)`/MWh captured price (vs. `r usd(cmp$cap[2],1)`), and sit `r round(cmp$dist[1],1)` km from transmission (vs. `r round(cmp$dist[2],1)` km). Winning counties combine strong, well-timed wind with a cheap grid connection.
+
+## Decomposing the NPV: what actually drives the ranking?
+
+```{r decomposition, fig.width=9, fig.height=5}
+top10_base %>%
+  transmute(label = paste0(FIPS, " (", state, ")"),
+            `PV revenue` = pv_revenue / 1e6,
+            `PV operating cost` = -pv_op_cost / 1e6,
+            `Fixed cost` = -fixed_cost / 1e6) %>%
+  pivot_longer(-label) %>%
+  ggplot(aes(reorder(label, value, sum), value, fill = name)) +
+  geom_col() +
+  geom_point(data = top10_base %>% transmute(label = paste0(FIPS, " (", state, ")"), value = npv / 1e6),
+             aes(label, value), inherit.aes = FALSE, shape = 23, size = 3, fill = "black") +
+  coord_flip() +
+  scale_fill_manual(values = c("PV revenue" = "#1a9850", "PV operating cost" = "#fdae61",
+                               "Fixed cost" = "#d73027")) +
+  labs(title = "Figure 10. NPV building blocks for the baseline top 10",
+       subtitle = "Diamond = NPV. Revenue (green) minus operating costs (orange) minus construction (red).",
+       x = NULL, y = "$ millions (present value)", fill = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+```{r variance-share}
+# How much of the cross-county spread in NPV comes from revenue vs. cost?
+v <- base %>% summarise(var_rev = var(pv_revenue), var_cost = var(fixed_cost + pv_op_cost),
+                        var_npv = var(npv))
+```
+
+Across all counties, the variance of PV revenue is `r round(v$var_rev / v$var_cost, 1)`× the variance of PV costs. **Location choice is mostly a revenue decision** (where the wind blows and what power is worth there). Costs matter mainly to rule out remote counties far from the grid.
+
+---
+
+# Sensitivity Analysis
+
+The case asks us to "consider sensitivity to plausible alternative assumptions." For each assumption we ask two questions: (1) how many counties are profitable, and (2) **does our top ten change?** A recommendation that survives most scenarios is one we can defend.
+
+```{r sensitivity}
+scenarios <- list(
+  "Baseline"                       = list(),
+  "Discount rate 4%"               = list(r = 0.04),
+  "Discount rate 8%"               = list(r = 0.08),
+  "Capex -20%"                     = list(capex_per_kw = 1968 * 0.8),
+  "Capex +20%"                     = list(capex_per_kw = 1968 * 1.2),
+  "Transmission $0.75M/km"         = list(beta_trans = 0.75e6),
+  "Transmission $3M/km"            = list(beta_trans = 3e6),
+  "Convex transmission cost"       = list(beta_trans_sq = 0.02e6),
+  "Road $1.5M/km"                  = list(beta_road = 1.5e6),
+  "O&M +50%"                       = list(alpha0 = 9, fixed_om_per_kw = 37.5),
+  "Land lease x3"                  = list(land_per_mw = 12000),
+  "Captured price -1%/yr (real)"   = list(price_growth = -0.01),
+  "Captured price +1%/yr (real)"   = list(price_growth = 0.01),
+  "REC $5/MWh in RPS states"       = list(rec_price = 5),
+  "Full PTC ($26/MWh, 10 yrs)"     = list(ptc = 26, p_ptc = 1)
+)
+
+run_scenario <- function(mods) compute_npv(wind, modifyList(p_base, mods))
+
+sens <- imap_dfr(scenarios, function(mods, nm) {
+  res <- run_scenario(mods)
+  top <- res %>% slice_max(npv, n = 10)
+  tibble(Scenario = nm,
+         `Counties with NPV > 0` = sum(res$npv > 0),
+         `Top-10 avg NPV ($M)`   = mean(top$npv) / 1e6,
+         `Overlap with baseline top 10` = length(intersect(top$FIPS, top10_base$FIPS)),
+         top_fips = list(top$FIPS))
+})
+
+sens %>% select(-top_fips) %>%
+  kable(digits = 1, caption = "Table 6. Sensitivity of profitability and of the top-10 list") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#eaf2f8")
+```
+
+```{r tornado, fig.width=9, fig.height=5.5}
+# Tornado: how much does the #1 baseline county's NPV move under each scenario?
+lead_fips <- top10_base$FIPS[1]
+tor <- imap_dfr(scenarios[-1], function(mods, nm) {
+  tibble(Scenario = nm, npv = run_scenario(mods) %>% filter(FIPS == lead_fips) %>% pull(npv))
+}) %>% mutate(delta = (npv - top10_base$npv[1]) / 1e6)
+
+ggplot(tor, aes(reorder(Scenario, abs(delta)), delta, fill = delta > 0)) +
+  geom_col() + coord_flip() +
+  geom_hline(yintercept = 0) +
+  scale_fill_manual(values = c("TRUE" = "#1a9850", "FALSE" = "#d73027"), guide = "none") +
+  labs(title = paste0("Figure 11. Tornado chart: change in NPV for the top baseline county (FIPS ", lead_fips, ")"),
+       x = NULL, y = "Change in NPV vs. baseline ($M)") +
+  theme_minimal()
+```
+
+```{r robust-set}
+# How often does each county appear in the top 10 across all scenarios?
+robust <- sens %>% select(Scenario, top_fips) %>% unnest(top_fips) %>%
+  count(FIPS = top_fips, name = "times_in_top10") %>%
+  left_join(base %>% select(FIPS, state, county_name, npv), by = "FIPS") %>%
+  arrange(desc(times_in_top10), desc(npv))
+
+robust %>% head(15) %>%
+  mutate(`Baseline NPV ($M)` = npv / 1e6) %>%
+  select(FIPS, County = county_name, State = state, `Times in top 10 (of 15 scenarios)` = times_in_top10, `Baseline NPV ($M)`) %>%
+  kable(digits = 1, caption = "Table 7. Most robust counties across all scenarios") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**What the sensitivity tells us.** Assumptions that shift *every* county's costs by the same amount (capex, O&M, property tax, the discount rate) move the *level* of NPV a lot (Figure 11) but barely reorder counties. The overlap column in Table 6 stays high. Assumptions that hit counties *differently* do reshuffle the list: the transmission cost per km, a PTC (which rewards high-output sites), and RECs (which reward RPS states). The counties in Table 7 that appear in the top ten across nearly all scenarios are the safest recommendations.
+
+---
+
+# Policy Uncertainty: What If a Production Tax Credit Returned?
+
+## Background
+
+The IRA's technology-neutral clean electricity production credit (§45Y) paid about **2.6¢/kWh ($26/MWh) for 10 years**. The One Big Beautiful Bill Act (OBBBA, July 2025) ends eligibility for wind and solar projects that **begin construction after July 4, 2026**, unless they are **placed in service by December 31, 2027**. Our farms begin construction in late 2026, so the baseline assumes **no credit**.
+
+Note that the 2027 deadline is a path to the credit under *current law* -- it needs no new legislation, only a fast build. Utility-scale wind construction itself typically takes 9-14 months once permits and an interconnection agreement are in hand, but the queue time before that (Section 11) routinely runs 1-4 years, so hitting Dec. 31, 2027 is tight, not impossible, for a farm starting construction in late 2026. We treat this as a second, independent channel on top of the political-reinstatement odds discussed below: either the farm finishes in time under current law (probability \(p_{2027}\)), or, failing that, Congress revives the credit later (\(p_{reinstate}\)). The combined probability the farm ever receives the credit is \(p_{PTC} = p_{2027} + (1-p_{2027}) \times p_{reinstate}\).
+
+## How does a PTC change the decision?
+
+```{r ptc}
+ptc_full <- run_scenario(list(ptc = 26, p_ptc = 1))
+top10_ptc <- ptc_full %>% slice_max(npv, n = 10)
+top10_table(top10_ptc, "Table 8. Top 10 counties if the full PTC applied")
+```
+
+With the full credit, **`r sum(ptc_full$npv > 0)` counties** become profitable (vs. `r n_pos` without). `r length(intersect(top10_ptc$FIPS, top10_base$FIPS))` of the baseline top ten stay in the list. The credit is paid **per MWh**, so it disproportionately rewards **high-capacity-factor** sites. The PTC top ten average a `r pct(mean(top10_ptc$capacity_factor))` capacity factor vs. `r pct(mean(top10_base$capacity_factor))` at baseline. A per-MWh subsidy pushes development toward the windiest places even if their power is less valuable per MWh.
+
+## Expected-value approach with a probability of reinstatement
+
+If the credit is reinstated with probability \(p\), the expected NPV is
+
+\[E[NPV_j] = NPV_j^{\text{no PTC}} + p \times PV(\text{PTC}_j)\]
+
+**What probability should we use for each channel?** For \(p_{2027}\) (finishing construction under current law), industry build-time benchmarks suggest roughly a 1-in-4 to 1-in-3 chance for a well-positioned site with an existing interconnection queue position, and much lower odds for a site starting from scratch; we use **\(p_{2027}\) = 20%** as a central guess. For \(p_{reinstate}\) (a future Congress reviving the credit), reinstatement would require new legislation -- the earliest realistic window follows the 2028 elections, and even then the credit would have to be made retroactive to projects already under construction, which tax law rarely does -- so we use a lower **\(p_{reinstate}\) = 10%**.
+
+```{r ptc-2027}
+p2027_grid <- c(0, 0.10, 0.20, 0.40, 0.60)
+preinstate <- 0.10
+tibble(p_2027 = p2027_grid, p_reinstate = preinstate,
+       p_combined = p_2027 + (1 - p_2027) * p_reinstate) %>%
+  mutate(across(everything(), ~pct(., 0))) %>%
+  kable(col.names = c("P(placed in service by 2027)", "P(future reinstatement)", "P(credit ever applies)"),
+        caption = "Table 9a. How 2027 construction-timeline risk and political reinstatement odds combine") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+p_combined_central <- 0.20 + (1 - 0.20) * preinstate
+```
+
+Our central case (\(p_{2027}\) = 20%, \(p_{reinstate}\) = 10%) gives a combined **`r pct(p_combined_central, 0)`** chance the credit ever applies -- meaningfully higher than looking at reinstatement politics alone, because the 2027 deadline needs no new law. We carry this combined probability, and a 0–60% range around it, into the expected-value analysis below.
+
+```{r ptc-prob, fig.width=8.5, fig.height=4.5}
+p_grid <- c(0, 0.05, p_combined_central, 0.30, 0.45, 0.60)
+ptc_prob <- map_dfr(p_grid, function(pp_) {
+  res <- run_scenario(list(ptc = 26, p_ptc = pp_))
+  top <- res %>% slice_max(npv, n = 10)
+  tibble(p = pp_, n_profitable = sum(res$npv > 0),
+         overlap = length(intersect(top$FIPS, top10_base$FIPS)),
+         avg_top10_npv = mean(top$npv) / 1e6)
+})
+
+ptc_prob %>%
+  mutate(p = pct(p, 0)) %>%
+  kable(col.names = c("P(credit ever applies)", "Counties NPV > 0", "Overlap with baseline top 10",
+                      "Top-10 avg expected NPV ($M)"),
+        digits = 1, caption = "Table 9. Expected-value analysis over the combined probability the PTC ever applies") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Takeaway.** At our central `r pct(p_combined_central, 0)` combined probability, the expected PTC is worth about `r usd_m(p_combined_central * mean(top10_base$gen_mwh) * 26 * sum((1 + p_base$r)^-(1:10)))` per top-ten farm. That is not enough to change many decisions by itself. Policy uncertainty therefore matters mostly through **option value**. If NextEra can cheaply secure land and interconnection positions in high-capacity-factor counties now (the counties that gain most in Table 8), it can both build faster -- improving its own odds of hitting the 2027 deadline -- and be ready if the credit later returns by statute. A good portfolio leans slightly toward those sites.
+
+---
+
+# Monte Carlo Robustness Check
+
+Table 6 and Table 7 move one assumption at a time. In reality, the discount rate, construction cost, transmission cost, price trend, and PTC status are all uncertain **together**. We draw `r comma(500)` random combinations of these five inputs from the ranges used above and recompute every county's NPV each time, to see how often each county would still look like a top-ten pick.
+
+```{r monte-carlo}
+set.seed(2026)
+n_mc <- 500
+mc_draws <- tibble(
+  draw         = 1:n_mc,
+  r            = runif(n_mc, 0.04, 0.08),
+  capex_per_kw = runif(n_mc, 1968 * 0.8, 1968 * 1.2),
+  beta_trans   = runif(n_mc, 0.75e6, 3e6),
+  price_growth = runif(n_mc, -0.01, 0.01),
+  ptc_hits     = rbinom(n_mc, 1, p_combined_central)
+) %>% mutate(ptc = ptc_hits * 26, p_ptc = 1)
+
+mc_fips_top10 <- vector("list", n_mc)
+mc_fips_pos   <- vector("list", n_mc)
+for (i in seq_len(n_mc)) {
+  p_i   <- modifyList(p_base, as.list(mc_draws[i, c("r", "capex_per_kw", "beta_trans", "price_growth", "ptc", "p_ptc")]))
+  res_i <- compute_npv(wind, p_i)
+  mc_fips_top10[[i]] <- res_i %>% slice_max(npv, n = 10) %>% pull(FIPS)
+  mc_fips_pos[[i]]   <- res_i$FIPS[res_i$npv > 0]
+}
+
+top10_tab <- table(unlist(mc_fips_top10))
+pos_tab   <- table(unlist(mc_fips_pos))
+
+mc_summary <- tibble(FIPS = base$FIPS) %>%
+  mutate(`P(top 10)`   = replace_na(as.numeric(top10_tab[as.character(FIPS)]), 0) / n_mc,
+         `P(NPV > 0)`  = replace_na(as.numeric(pos_tab[as.character(FIPS)]), 0) / n_mc) %>%
+  left_join(base %>% select(FIPS, County = county_name, State = state, `Baseline NPV ($M)` = npv), by = "FIPS") %>%
+  mutate(`Baseline NPV ($M)` = `Baseline NPV ($M)` / 1e6) %>%
+  arrange(desc(`P(top 10)`))
+
+mc_summary %>% head(15) %>% select(FIPS, County, State, `Baseline NPV ($M)`, `P(top 10)`, `P(NPV > 0)`) %>%
+  mutate(`P(top 10)` = pct(`P(top 10)`, 0), `P(NPV > 0)` = pct(`P(NPV > 0)`, 0)) %>%
+  kable(digits = 1, caption = "Table 7b. Monte Carlo robustness: 500 joint draws over discount rate, capex, transmission cost, price trend and PTC status") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+n_mc_top10_half   <- sum(mc_summary$`P(top 10)` >= 0.5)
+pct_profitable_mc <- round(100 * mean(sapply(mc_fips_pos, length) / nrow(base)), 0)
+```
+
+`r n_mc_top10_half` counties land in the top ten in at least half of the 500 draws. `r pct_profitable_mc`% of counties are profitable on average across draws, consistent with the baseline and PTC-scenario counts above. The one-at-a-time sensitivities (Table 6) and the joint Monte Carlo analysis agree on substantially the same short list of "safe" counties, which is reassuring: the recommendation is not an artefact of any single assumption.
+
+---
+
+# Should NextEra Be Treated as a Price-Taker?
+
+Exercise 2 assumes the farm can sell every MWh at today's price. Two reasons to relax that:
+
+1. **Own-price effect.** Adding 200 MW of zero-marginal-cost supply pushes the market-clearing price down in the hours the farm produces (the "merit-order effect"). One farm is small relative to most balancing areas, but ten farms in the same region are not.
+2. **Cannibalization over time.** As more wind is built in a region, *all* wind farms there increasingly produce in the same windy, low-price hours, so the value factor falls over the farm's 25-year life.
+
+We can test the second channel with our own data: are value factors lower where there is already a lot of wind? A **state** is too coarse a market for this -- e.g. New York state spans several Cambium balancing areas with different prices -- so we use the `r comma(n_balancing_areas)` balancing areas recovered above as the unit of "the local market."
+
+```{r cannibalization}
+wind_area <- wind %>%
+  group_by(balancing_area) %>% mutate(area_turbines = sum(count_turbines)) %>% ungroup()
+
+cann <- lm(value_factor ~ log1p(area_turbines) + log1p(count_turbines), data = wind_area)
+cann_coef <- coef(cann)
+summary(cann)$coefficients %>%
+  kable(digits = 4, caption = "Table 10. Do value factors fall where wind is already built? (OLS, county level, by balancing area)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r cannibalization-plot, fig.width=8, fig.height=4.5}
+ggplot(wind_area, aes(area_turbines + 1, value_factor)) +
+  geom_point(alpha = 0.25, colour = "#2c7fb8") +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "black") +
+  scale_x_log10(labels = comma) +
+  labs(title = "Figure 12. Wind value factor vs. existing wind in the balancing area",
+       x = "Turbines in the balancing area, 2023 (log scale)", y = "Value factor") +
+  theme_minimal()
+```
+
+A tenfold increase in balancing-area turbines is associated with a `r round(cann_coef[2]*log(10), 3)` change in the value factor. This is a correlation, not a causal estimate: windy balancing areas have both more turbines and more correlated output. It is still a warning sign. **Counties in already-saturated wind markets face a declining captured price.** The "Captured price -1%/yr" scenario in Table 6 is our way of building this in. Under it, the top ten shift toward counties in markets with less existing wind. We also use balancing area directly as a third diversification constraint below (Table 12), alongside state and output correlation.
+
+**Better data would help here.** Revenue estimates could be improved with (a) multi-year wind data (2014 may have been an unusually windy or calm year; NREL's WIND Toolkit covers 2007–2013), (b) Cambium's *forward-looking* price projections under high-renewables scenarios rather than one historical year, (c) LBNL's PPA price data, which tell us what buyers actually pay for wind by region, and (d) capacity-market payments, which reward output during peak hours.
+
+---
+
+# Local Permitting and Community Acceptance
+
+## How should local regulation enter the decision?
+
+Permitting does not change what a farm earns if it gets built. It changes the **probability that the farm gets built at all** and **how long it takes**. Columbia's Sabin Center tracked at least **888 state and local restrictions on renewables** (setbacks, moratoria, outright bans, in effect or expired) across the U.S. as of its 2026 report, up sharply from 459 at the end of 2024 -- opposition is a fast-growing and now routine part of siting risk, not a tail case. Our data contain two useful signals:
+
+* **`count_turbines` > 0:** the county has already approved wind before. This is revealed acceptance and a working permitting process.
+* **`count_houses1` (homes in the nearest distance band):** more neighbours means more potential objectors.
+
+We convert these into a simple permitting-success probability and compute a **risk-adjusted NPV**. If the project fails, NextEra loses its development spending (NREL: about $36/kW, or $7.2M):
+
+\[E[NPV_j] = \pi_j \cdot NPV_j - (1-\pi_j)\cdot \text{DevCost}\]
+
+```{r permitting}
+dev_cost   <- 36 * 200 * 1000
+house_p90  <- quantile(wind$count_houses1, 0.9, na.rm = TRUE)
+
+base <- base %>%
+  mutate(
+    p_permit = 0.80 + 0.10 * (count_turbines > 0) - 0.15 * (count_houses1 > house_p90),
+    npv_risk = p_permit * npv - (1 - p_permit) * dev_cost
+  )
+```
+
+The probabilities are stylized (80% base, +10 points with existing wind, −15 points in the 10% most densely settled sites). They are meant to show *how* to bring permitting into the decision, not a calibrated estimate. The best available county-level calibration data we are aware of but have not incorporated is NREL/OEDI's 2025 wind siting ordinance and zoning database, which flags restrictions by county; wiring that in (replacing `count_houses1` as the opposition proxy with an actual restriction flag) would be a natural next step, and we flag it rather than build it here since it means pulling in a new, large external dataset.
+
+## A wider lens: property-value spillovers
+
+Neighbours' objections reflect a real cost. LBNL's study of essentially every U.S. wind project (Brunner, Hoen, Rand & Schwegman, 2024) finds **home values within 1 mile fall about 11% after a project is announced**, with much smaller effects 1–2 miles out and none beyond 2 miles. The effect fades to statistical insignificance roughly 5 years after operation begins. We treat `sum_prices1`/`sum_prices2` as the total value of homes within the first and second distance bands around the county's candidate sites (the bands are cumulative in the data) and estimate:
+
+```{r externality}
+base <- base %>%
+  mutate(prop_value_loss = 0.11 * sum_prices1 + 0.03 * pmax(sum_prices2 - sum_prices1, 0),
+         social_npv      = npv - prop_value_loss)
+
+base %>% slice_max(npv, n = 10) %>%
+  transmute(FIPS, County = county_name, State = state, `NPV ($M)` = npv / 1e6,
+            `Homes in band 1` = count_houses1,
+            `Est. property-value loss ($M)` = prop_value_loss / 1e6,
+            `Permit prob.` = p_permit, `Risk-adj. NPV ($M)` = npv_risk / 1e6) %>%
+  kable(digits = 2, caption = "Table 11. Baseline top 10: permitting risk and neighbour impacts") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The property-value loss is an **externality**: NextEra doesn't pay it, so it does not enter private NPV. It still matters to NextEra because it predicts opposition, and it matters to a regulator because it is a real social cost. Wind is usually sited in sparsely populated places, so for most top counties these losses are small relative to NPV. Counties where they are large deserve a closer look, and a voluntary "good-neighbour" payment program may be cheaper than a failed permit.
+
+---
+
+# Cluster or Spread Out?
+
+## The trade-off
+
+Picking the ten highest-NPV counties will tend to pick ten neighbours in the same windy region. That has advantages (shared supply chains, crews, maybe a shared transmission line) but two serious risks:
+
+1. **Correlated output.** Neighbouring farms share weather, so they produce in the same hours. NextEra's total output becomes lumpier, and the farms depress each other's prices (Section 10).
+2. **Correlated policy and market risk.** If one state changes its siting rules or one regional grid becomes congested, all ten farms are exposed at once.
+
+Spreading out is like diversifying a stock portfolio: we give up a little expected return for a large reduction in risk.
+
+```{r correlation}
+pool <- base %>% slice_max(npv_risk, n = 40)
+
+hourly_rev <- pp[FIPS %in% pool$FIPS, .(FIPS, hour, rev = prod_kwh / 1000 * price, mwh = prod_kwh / 1000)]
+gen_wide   <- dcast(hourly_rev, hour ~ FIPS, value.var = "mwh")
+cor_mat    <- cor(as.matrix(gen_wide[, -1]))
+
+# Greedy diversified selection: best risk-adjusted NPV first, subject to
+# (i) at most 2 farms per state, (ii) at most 2 farms per balancing area (the same
+# economic market, per Section 10's cannibalization result), and (iii) hourly-output
+# correlation < 0.8 with any farm already chosen
+select_diversified <- function(pool, cor_mat, n = 10, max_per_state = 2, max_per_area = 2, max_cor = 0.8) {
+  chosen <- c()
+  for (f in pool$FIPS[order(-pool$npv_risk)]) {
+    st <- pool$state[pool$FIPS == f]
+    ba <- pool$balancing_area[pool$FIPS == f]
+    ok_state <- sum(pool$state[pool$FIPS %in% chosen] == st) < max_per_state
+    ok_area  <- sum(pool$balancing_area[pool$FIPS %in% chosen] == ba) < max_per_area
+    ok_cor   <- length(chosen) == 0 ||
+                max(cor_mat[as.character(f), as.character(chosen)]) < max_cor
+    if (ok_state && ok_area && ok_cor) chosen <- c(chosen, f)
+    if (length(chosen) == n) break
+  }
+  # Fall back to highest remaining if the constraints are too tight
+  if (length(chosen) < n)
+    chosen <- c(chosen, head(setdiff(pool$FIPS[order(-pool$npv_risk)], chosen), n - length(chosen)))
+  chosen
+}
+
+naive_fips <- pool %>% slice_max(npv_risk, n = 10) %>% pull(FIPS)
+div_fips   <- select_diversified(pool, cor_mat)
+
+portfolio_stats <- function(fips_set) {
+  hr <- hourly_rev[FIPS %in% fips_set, .(rev = sum(rev), mwh = sum(mwh)), by = hour]
+  sub <- cor_mat[as.character(fips_set), as.character(fips_set)]
+  tibble(`Expected risk-adj. NPV ($M)` = sum(base$npv_risk[base$FIPS %in% fips_set]) / 1e6,
+         `States represented`           = n_distinct(base$state[base$FIPS %in% fips_set]),
+         `Balancing areas represented`  = n_distinct(base$balancing_area[base$FIPS %in% fips_set]),
+         `Avg pairwise output correlation` = mean(sub[upper.tri(sub)]),
+         `Std dev of hourly output (MWh)` = sd(hr$mwh),
+         `Hours with < 10% of capacity`  = sum(hr$mwh < 0.1 * 200 * length(fips_set)))
+}
+
+bind_rows(portfolio_stats(naive_fips) %>% mutate(Portfolio = "Top 10 by NPV (clustered)"),
+          portfolio_stats(div_fips)   %>% mutate(Portfolio = "Diversified top 10")) %>%
+  relocate(Portfolio) %>%
+  kable(digits = 2, caption = "Table 12. Clustered vs. diversified portfolios") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## How sensitive is this to the diversification thresholds?
+
+The 2-per-state, 2-per-balancing-area, correlation-below-0.8 rule above was a judgment call. We test how much it matters by re-running the greedy selection at looser and tighter settings.
+
+```{r cluster-sensitivity}
+threshold_grid <- tibble(
+  `Max/state` = c(3,   2,   2,   2,   1),
+  `Max/area`  = c(2,   2,   2,   1,   1),
+  `Max corr.` = c(0.9, 0.8, 0.6, 0.8, 0.6)
+)
+
+cluster_sens <- threshold_grid %>%
+  mutate(fips_set = pmap(list(`Max/state`, `Max/area`, `Max corr.`),
+                          ~select_diversified(pool, cor_mat, max_per_state = ..1,
+                                               max_per_area = ..2, max_cor = ..3)),
+         stats = purrr::map(fips_set, portfolio_stats)) %>%
+  select(-fips_set) %>% unnest(stats)
+
+cluster_sens %>%
+  kable(digits = 2, caption = "Table 12a. How the cluster/spread thresholds change the recommended portfolio") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(2, bold = TRUE)
+```
+
+Row 2 (bold) is our chosen rule. Loosening it (row 1) recovers most of the clustered portfolio's NPV at the cost of more correlated output; tightening it (rows 3-5) buys a modestly more diversified fleet for a small further NPV cost. Expected NPV does not change by more than a few percent across this whole range, so **the recommended ten counties are not highly sensitive to the exact diversification rule** -- the real decision is clustered-vs-diversified in principle (Table 12), not the precise thresholds.
+
+```{r corr-heat, fig.width=7.5, fig.height=6.5}
+cor_mat[as.character(naive_fips), as.character(naive_fips)] %>%
+  as_tibble(rownames = "a") %>% pivot_longer(-a, names_to = "b") %>%
+  ggplot(aes(a, b, fill = value)) + geom_tile() +
+  scale_fill_viridis_c(option = "magma", limits = c(min(0, min(cor_mat)), 1)) +
+  labs(title = "Figure 13. Hourly output correlation among the clustered top 10",
+       x = "FIPS", y = "FIPS", fill = "Correlation") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The diversified portfolio gives up a little expected NPV (Table 12) in exchange for markedly lower output correlation, more states, and fewer hours in which the whole fleet is becalmed. For a company of NextEra's size, with long-term delivery contracts to honour, that trade is usually worth making. **We recommend the diversified list.**
+
+---
+
+# Recommendation
+
+## Ten recommended counties
+
+Our final list is chosen in three steps:
+
+1. Rank all counties by **risk-adjusted NPV** (baseline economics × probability of permitting success).
+2. Keep the top 40, then select ten greedily subject to **at most two farms per state**, **at most two per balancing area**, and **hourly-output correlation below 0.8** with any farm already chosen.
+3. Cross-check against the sensitivity analysis (Table 7) and the PTC scenarios (Table 8).
+
+```{r final-table}
+final <- base %>% filter(FIPS %in% div_fips) %>%
+  left_join(robust %>% select(FIPS, times_in_top10), by = "FIPS") %>%
+  mutate(times_in_top10 = coalesce(times_in_top10, 0L),
+         in_ptc_top10   = FIPS %in% top10_ptc$FIPS) %>%
+  arrange(desc(npv_risk))
+
+final %>%
+  transmute(Rank = row_number(), FIPS, County = county_name, State = state,
+            `Gen (GWh/yr)`        = gen_mwh / 1000,
+            `CF`                  = pct(capacity_factor),
+            `Revenue ($M/yr)`     = revenue / 1e6,
+            `Fixed cost ($M)`     = fixed_cost / 1e6,
+            `Op. cost ($M/yr)`    = annual_op_cost / 1e6,
+            `Op. profit ($M/yr)`  = annual_profit / 1e6,
+            `NPV ($M)`            = npv / 1e6,
+            `Break-even price ($/MWh)` = breakeven_price,
+            `Top-10 in # scenarios` = times_in_top10,
+            `Top-10 with PTC?`    = ifelse(in_ptc_top10, "Yes", "No")) %>%
+  kable(digits = 1, caption = "Table 13. Recommended counties and key economic statistics (baseline, 2023$)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = TRUE) %>%
+  column_spec(11, bold = TRUE)
+```
+
+```{r map-final, fig.width=9, fig.height=5.5}
+county_shapes %>%
+  left_join(base %>% select(FIPS, npv), by = "FIPS") %>%
+  ggplot(aes(long, lat, group = group)) +
+  geom_polygon(aes(fill = npv / 1e6), colour = NA) +
+  geom_polygon(data = county_shapes %>% filter(FIPS %in% div_fips),
+               fill = NA, colour = "red", linewidth = 0.8) +
+  borders("state", colour = "white", linewidth = 0.2) +
+  coord_quickmap() +
+  scale_fill_viridis_c(option = "viridis", labels = label_dollar(suffix = "M"),
+                       na.value = "grey85", name = "Baseline NPV ($M)") +
+  labs(title = "Figure 14. Recommended counties (outlined in red)") +
+  theme_void() + theme(legend.position = "bottom", legend.key.width = unit(1.6, "cm"))
+```
+
+## Summary for the boss
+
+* **Portfolio:** ten 200 MW farms in `r n_distinct(final$state)` states, generating `r comma(round(sum(final$gen_mwh)/1000))` GWh/yr and `r usd_m(sum(final$revenue))`/yr of revenue at 2023 prices, for an up-front investment of `r usd_m(sum(final$fixed_cost), 0)`.
+* **Value:** combined baseline NPV of `r usd_m(sum(final$npv), 0)` (`r sum(final$npv > 0)` of 10 individually positive) at a 6% real discount rate with **no** tax credit. The average break-even captured price is `r usd(mean(final$breakeven_price), 1)`/MWh, so **any PPA signed above that price makes the farm profitable.**
+* **Robustness:** on average, recommended counties stay in the top ten in `r round(mean(final$times_in_top10), 1)` of 15 sensitivity scenarios.
+* **Policy upside:** `r sum(final$in_ptc_top10)` of the ten would also be top-ten picks if a PTC returned. If the credit were reinstated, the farms in high-capacity-factor counties would gain the most.
+
+## Limitations and the strongest objections
+
+1. **One weather year, one price year.** Revenues rest on 2014 wind and 2023 prices. A calm year or a price collapse in a single balancing area could reorder counties. Multi-year wind data and forward price curves would help most.
+2. **Merchant-price framing.** Real wind farms sell most output under PPAs. If PPA premia differ by region, our ranking could be off. The break-even price column shows what PPA price each county needs.
+3. **Cost coefficients are national averages.** Regional differences in labour, foundation conditions (e.g. frozen ground), and especially **interconnection-queue upgrade costs** are not in the data and can exceed the spur-line cost (LBNL puts the average at $194/kW for completed wind projects, up to $671/kW for those that withdraw -- see Section 5). Before committing, NextEra should check each county's actual queue position and upgrade estimate.
+4. **Permitting probabilities are stylized.** They show the method, not calibrated estimates. We know of one source that would sharpen them -- NREL/OEDI's 2025 county-level wind siting ordinance database -- but have not pulled it in (see Section 11).
+5. **Pre-tax analysis.** Depreciation, income taxes and tax-credit transferability change NPV levels. Because they apply similarly everywhere, they should have limited effect on the ranking.
+6. **Within-county siting.** County averages hide variation: the best site in a county may be much closer to transmission than the county average.
+7. **Distance-band units for `count_houses`/`sum_prices` are not confirmed.** We assume the rings are in miles, consistent with the LBNL property-value literature we cite in Section 11's property-value section -- but the data documentation does not state the units, and our own check (comparing county-average population density implied by `count_houses1` against both a 1-mile and a 1-km circle) was inconclusive, because turbines are sited in the sparsest part of a county rather than uniformly across it. This affects the `house_p90` permitting cutoff and the Table 11 property-value-loss estimate; if the rings are actually in kilometers, both would be mis-scaled.
+
+## Sources
+
+* NREL (2025). *Cost of Wind Energy Review: 2024 Edition.* NREL/TP-5000-91775. Land-based reference project: CapEx $1,968/kW, OpEx $43/kW-yr, 25-year life, 2023$.
+* MISO. *Transmission Cost Estimation Guide* (MTEP24, 2024 edition). Per-mile costs for new 138–345 kV single-circuit lines.
+* LBNL/Berkeley Lab (2026). *Generator Interconnection Costs to the Transmission System in Non-ISO Balancing Authorities* and related interconnection-cost-trends reports. Network-upgrade costs for land-based wind by project outcome (complete/active/withdrawn).
+* Brunner, Hoen, Rand & Schwegman (2024). "Commercial wind turbines and residential home values: New evidence from the universe of land-based wind projects in the United States." *Energy Policy* (LBNL).
+* Columbia Sabin Center for Climate Change Law. *Opposition to Renewable Energy Facilities in the United States* (2026 ed.). County/state restriction counts.
+* NREL/OEDI (2025). *U.S. Wind Siting Regulation and Zoning Ordinances.* Not yet incorporated here (see Section 11 and limitations).
+* IRS Notice 2025-42 and OBBBA §70512: beginning-of-construction and placed-in-service deadlines for wind and solar under §45Y/§48E.
