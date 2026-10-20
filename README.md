@@ -2,11 +2,11 @@
 
 A techno-economic analysis of where a utility should site ten new 200 MW merchant wind farms across the U.S., using county-level turbine siting characteristics and hourly 2023 wholesale electricity price/production data (26.4M hourly records, 3,018 counties).
 
-**[View the full report](./wind_farm_siting_analysis.html)** (download and open in a browser, or see the rendered version if hosted via GitHub Pages).
+**[View the full report](https://usama1208.github.io/wind-farm-siting-analysis/)**
 
 ## What's here
 - `wind_farm_siting_analysis.Rmd` — full R Markdown source: data cleaning, revenue/cost/NPV modeling, policy-uncertainty (PTC) scenarios, Monte Carlo robustness checks, and portfolio diversification analysis.
-- `wind_farm_siting_analysis.html` — rendered report with all tables, figures, and the final 10-county recommendation.
+- `index.html` — rendered report with all tables, figures, and the final 10-county recommendation (same content as the link above).
 - `RESULTS_SUMMARY.md` — one-page summary of headline findings.
 - `CHANGELOG.md` — log of data-quality issues found and fixed, and methodology decisions.
 - `CountyChars.csv` — county-level characteristics (turbine siting factors, demographics, transmission distance, etc.).
